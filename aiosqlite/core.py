@@ -8,28 +8,23 @@ Core implementation of aiosqlite proxies
 import asyncio
 import logging
 import sqlite3
-import sys
-import warnings
 from functools import partial
 from pathlib import Path
 from queue import Empty, Queue
 from threading import Thread
+
 from typing import (
     Any,
     AsyncIterator,
     Callable,
     Generator,
     Iterable,
+    Literal,
     Optional,
     Type,
     Union,
 )
 from warnings import warn
-
-if sys.version_info >= (3, 8):
-    from typing import Literal
-else:
-    from typing_extensions import Literal
 
 from .context import contextmanager
 from .cursor import Cursor
@@ -40,13 +35,6 @@ LOG = logging.getLogger("aiosqlite")
 
 
 IsolationLevel = Optional[Literal["DEFERRED", "IMMEDIATE", "EXCLUSIVE"]]
-
-
-def get_loop(future: asyncio.Future) -> asyncio.AbstractEventLoop:
-    if sys.version_info >= (3, 7):
-        return future.get_loop()
-    else:
-        return future._loop
 
 
 class Connection(Thread):
@@ -76,16 +64,12 @@ class Connection(Thread):
 
         return self._connection
 
-    def _execute_insert(
-        self, sql: str, parameters: Iterable[Any]
-    ) -> Optional[sqlite3.Row]:
+    def _execute_insert(self, sql: str, parameters: Any) -> Optional[sqlite3.Row]:
         cursor = self._conn.execute(sql, parameters)
         cursor.execute("SELECT last_insert_rowid()")
         return cursor.fetchone()
 
-    def _execute_fetchall(
-        self, sql: str, parameters: Iterable[Any]
-    ) -> Iterable[sqlite3.Row]:
+    def _execute_fetchall(self, sql: str, parameters: Any) -> Iterable[sqlite3.Row]:
         cursor = self._conn.execute(sql, parameters)
         return cursor.fetchall()
 
@@ -114,7 +98,7 @@ class Connection(Thread):
                     if not fut.done():
                         fut.set_result(result)
 
-                get_loop(future).call_soon_threadsafe(set_result, future, result)
+                future.get_loop().call_soon_threadsafe(set_result, future, result)
             except BaseException as e:
                 LOG.debug("returning exception %s", e)
 
@@ -122,7 +106,7 @@ class Connection(Thread):
                     if not fut.done():
                         fut.set_exception(e)
 
-                get_loop(future).call_soon_threadsafe(set_exception, future, e)
+                future.get_loop().call_soon_threadsafe(set_exception, future, e)
 
     async def _execute(self, fn, *args, **kwargs):
         """Queue a function with the given arguments for execution."""
@@ -185,7 +169,9 @@ class Connection(Thread):
             self._connection = None
 
     @contextmanager
-    async def execute(self, sql: str, parameters: Iterable[Any] = None) -> Cursor:
+    async def execute(
+        self, sql: str, parameters: Optional[Iterable[Any]] = None
+    ) -> Cursor:
         """Helper to create a cursor and execute the given query."""
         if parameters is None:
             parameters = []
@@ -194,7 +180,7 @@ class Connection(Thread):
 
     @contextmanager
     async def execute_insert(
-        self, sql: str, parameters: Iterable[Any] = None
+        self, sql: str, parameters: Optional[Iterable[Any]] = None
     ) -> Optional[sqlite3.Row]:
         """Helper to insert and get the last_insert_rowid."""
         if parameters is None:
@@ -203,7 +189,7 @@ class Connection(Thread):
 
     @contextmanager
     async def execute_fetchall(
-        self, sql: str, parameters: Iterable[Any] = None
+        self, sql: str, parameters: Optional[Iterable[Any]] = None
     ) -> Iterable[sqlite3.Row]:
         """Helper to execute a query and return all the data."""
         if parameters is None:
@@ -237,36 +223,25 @@ class Connection(Thread):
         that query executions take place so instead of executing directly
         against the connection, we defer this to `run` function.
 
-        In Python 3.8 and above, if *deterministic* is true, the created
-        function is marked as deterministic, which allows SQLite to perform
-        additional optimizations. This flag is supported by SQLite 3.8.3 or
-        higher, ``NotSupportedError`` will be raised if used with older
-        versions.
+        If ``deterministic`` is true, the created function is marked as deterministic,
+        which allows SQLite to perform additional optimizations. This flag is supported
+        by SQLite 3.8.3 or higher, ``NotSupportedError`` will be raised if used with
+        older versions.
         """
-        if sys.version_info >= (3, 8):
-            await self._execute(
-                self._conn.create_function,
-                name,
-                num_params,
-                func,
-                deterministic=deterministic,
-            )
-        else:
-            if deterministic:
-                warnings.warn(
-                    "Deterministic function support is only available on "
-                    'Python 3.8+. Function "{}" will be registered as '
-                    "non-deterministic as per SQLite defaults.".format(name)
-                )
-
-            await self._execute(self._conn.create_function, name, num_params, func)
+        await self._execute(
+            self._conn.create_function,
+            name,
+            num_params,
+            func,
+            deterministic=deterministic,
+        )
 
     @property
     def in_transaction(self) -> bool:
         return self._conn.in_transaction
 
     @property
-    def isolation_level(self) -> IsolationLevel:
+    def isolation_level(self) -> Optional[str]:
         return self._conn.isolation_level
 
     @isolation_level.setter
@@ -274,11 +249,11 @@ class Connection(Thread):
         self._conn.isolation_level = value
 
     @property
-    def row_factory(self) -> "Optional[Type]":  # py3.5.2 compat (#24)
+    def row_factory(self) -> Optional[Type]:
         return self._conn.row_factory
 
     @row_factory.setter
-    def row_factory(self, factory: "Optional[Type]") -> None:  # py3.5.2 compat (#24)
+    def row_factory(self, factory: Optional[Type]) -> None:
         self._conn.row_factory = factory
 
     @property
@@ -356,16 +331,13 @@ class Connection(Thread):
         pages: int = 0,
         progress: Optional[Callable[[int, int, int], None]] = None,
         name: str = "main",
-        sleep: float = 0.250
+        sleep: float = 0.250,
     ) -> None:
         """
         Make a backup of the current database to the target database.
 
         Takes either a standard sqlite3 or aiosqlite Connection object as the target.
         """
-        if sys.version_info < (3, 7):
-            raise RuntimeError("backup() method is only available on Python 3.7+")
-
         if isinstance(target, Connection):
             target = target._conn
 
@@ -384,7 +356,7 @@ def connect(
     *,
     iter_chunk_size=64,
     loop: Optional[asyncio.AbstractEventLoop] = None,
-    **kwargs: Any
+    **kwargs: Any,
 ) -> Connection:
     """Create and return a connection proxy to the sqlite database."""
 
